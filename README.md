@@ -4,8 +4,9 @@ Hands-free screen control via webcam gaze and blinks.
 Pygame full-screen demo. Offline. CPU-only.
 
 ## Status
-Stage 0/8 complete. Stage 1 implementation is ready for live webcam acceptance
-testing.
+Stages 0–2 complete. Stage 3 now uses fixed-window calibration, per-dot fit
+residual checks with bad-dot-only redo, and five-point live cursor verification.
+Live acceptance is pending.
 
 ## Setup
 python -m venv .venv
@@ -13,10 +14,13 @@ python -m venv .venv
 pip install -r requirements.txt
 
 ## Run
-python main.py
+`python main.py` starts calibration if `config.json` is missing, invalid, or
+not verified; otherwise it opens the diagnostic preview. Use
+`.venv\Scripts\python.exe main.py --calibrate` to repeat calibration, or
+`python main.py --preview` to explicitly open the face/iris diagnostic.
 
-Stage 1 run and acceptance steps are in STAGE_1.md. Press Q or Esc in the
-preview to close it.
+See STAGE_1.md, STAGE_2.md, and STAGE_3.md for details and acceptance checks.
+Press Q or Esc to close the preview or cancel calibration.
 
 ## Spec
 See SPEC_LOCK.md.

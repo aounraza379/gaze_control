@@ -20,12 +20,35 @@
 
 ## Calibration
 - 9 dots, 3x3 grid, shown one at a time.
-- Each dot: 0.5 s settle time, then collect 1.0 s of samples.
-- Sample = one frame where: face detected AND EAR > 0.25 AND |yaw| < 15° AND |pitch| < 15°.
+- Each dot: show a pulsing 3, 2, 1 countdown (1 s each), then collect 1.0 s
+  of samples.
+- Before the nine targets, show a center reference dot, allow 0.5 s to settle,
+  then capture a 2 s neutral head-pose baseline while the user faces the camera
+  naturally; use the median of at least 10 yaw/pitch readings. Collect and
+  assess gaze readings at the prompted calibration dots.
+- Sample = one frame where: face detected AND EAR > 0.25 AND
+  |yaw - baseline_yaw| < 15° AND |pitch - baseline_pitch| < 15° AND gaze
+  available.
+- Each target displays "Look at this dot and hold your gaze steady" during the
+  countdown. Sampling starts only after the countdown.
+- Compute the population standard deviation of gx and gy over each dot's
+  collected samples. If either axis standard deviation exceeds 0.02, or if no
+  valid samples were collected, fail and repeat that dot with a gaze-not-steady
+  warning. Allow up to 3 retries per dot; if the third retry also fails
+  steadiness, abort calibration and do not save a verified config.
 - Fit: screen_x = c0 + c1*gx + c2*gy + c3*gx^2 + c4*gy^2 + c5*gx*gy.
 - Same form for screen_y with coefficients d0..d5.
 - Fit method: numpy.linalg.lstsq on design matrix A of shape (N, 6).
-- Save 12 coefficients to config.json.
+- After fitting, compute mean pixel residual for each dot from all its samples.
+  A dot is bad if it has no valid samples or its mean residual exceeds 15% of
+  the screen diagonal. Redo only bad dots, then refit and reevaluate.
+- Once all dot residuals pass, run cursor verification at 5 random inset screen
+  points. Show each point for 1 s, draw predicted cursor position live, and
+  report per-point and overall mean pixel error. Verification passes when the
+  overall mean error is below 10% of the screen diagonal.
+- Save the 12 coefficients and `verified: true` only if all nine dots passed
+  steadiness and cursor verification passes. Missing, corrupt, or unverified
+  calibration config must not enable later interaction stages.
 
 ## Accuracy Metric (single, used everywhere)
 - mean_2d_error = mean(||pred - true||) / sqrt(W^2 + H^2)

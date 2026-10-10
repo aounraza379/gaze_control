@@ -1,66 +1,85 @@
 # Project State — Gaze Control
 
 ## Mission
-Build a full-screen Pygame gaze-control demo for hands-free screen interaction using webcam-based facial landmark tracking. No OS cursor control, no multi-monitor support, no network calls.
+Build a full-screen, offline, CPU-only Pygame gaze-control demo using webcam
+facial landmarks. The app does not control the OS cursor or other applications.
 
 ## Constraints
-- Python 3.11
-- Full-screen app space equals screen pixels; calibration space equals app space
-- Offline-only; no video leaves the machine
-- Scope limited to Pygame demo only
-- Out-of-scope items: OS cursor control, multi-monitor, mobile/web, custom ML, user accounts/cloud sync, unlisted features
-
-## Source-of-truth specification
-- SPEC_LOCK.md
-- PROGRESS.md
+- Python 3.11 and pinned packages in `requirements.txt`.
+- Full-screen Pygame coordinate space; no window offsets or multi-monitor.
+- Video remains local; no network calls.
+- Follow `SPEC_LOCK.md`; do not implement out-of-scope behavior.
 
 ## Current status
 - Stage 0: environment setup — COMPLETE
-- Stage 1: landmarks — IMPLEMENTATION READY; live webcam acceptance pending
-- Stage 2: iris — PENDING
-- Stage 3: calibration — PENDING
+- Stage 1: landmarks — COMPLETE; user confirmed smooth tracking
+- Stage 2: iris — COMPLETE; user confirmed directional response; raw gaze is
+  noisy and has small dynamic range
+- Stage 3: calibration and cursor verification — IMPLEMENTED; live acceptance
+  pending
 - Stage 4: smoothing — PENDING
 - Stage 5: dwell — PENDING
 - Stage 6: blink — PENDING
 - Stage 7: scroll — PENDING
 - Stage 8: polish — PENDING
 
-## What Stage 0 includes
-- Create a Python 3.11 virtual environment
-- Install the pinned project dependencies
-- Verify imports and package versions
-- Keep setup instructions in the repo for future agents
+## Stage 1
+- `main.py` opens a local webcam at 640x480 and processes Face Mesh with refined
+  landmarks.
+- User confirmed face detection and smoothly moving landmarks.
 
-## Stage 1 implementation
-- `main.py` opens a local webcam, requests 640x480 frames, converts BGR to RGB,
-  and processes frames with MediaPipe Face Mesh (`refine_landmarks=True`,
-  `max_num_faces=1`).
-- Detected landmark points are drawn on the camera image; no gaze mapping,
-  calibration, cursor movement, or OS interaction is implemented.
-- Run with `python main.py`; use `--camera-index N` for a different camera.
-- Press Q or Esc to quit.
-- Automated renderer tests: `.venv\Scripts\python.exe -m unittest discover -s tests -v`.
-- Stage 1 remains IN PROGRESS until the live camera acceptance checklist in
-  STAGE_1.md is completed.
+## Stage 2
+- Displays refined iris centers and normalized `(gx, gy)` ratios relative to
+  eye corners and eyelid opening. This rough signal is not screen coordinates.
+- An open eye can provide gaze if the other is closed; gaze is unavailable when
+  neither eye is usable.
+- User confirmed markers and direction changes; raw frame jitter is expected
+  before the later smoothing stage.
 
-## Current repository snapshot
-- Root: E:\bigdata\git-clone\gaze_control
-- Primary docs:
-  - SPEC_LOCK.md — immutable feature spec and formulas
-  - PROGRESS.md — stage tracker and completion log
-  - PROJECT_STATE.md — this handoff file for context continuity
-- Dependency file:
-  - requirements.txt
+## Stage 3 architecture and implementation
+- Run `.\.venv\Scripts\python.exe main.py --calibrate` for full-screen 3x3
+  calibration.
+- Captures only a user-specific neutral head-pose median: 0.5-second settle,
+  2-second capture, at least 10 readings.
+- For each dot: a pulsing 3-2-1 countdown (one second per number) with the
+  instruction to look at the dot and hold steady, then a fixed 1-second
+  collection window. Sensor-valid samples require detected face, gaze
+  available, EAR > 0.25, and yaw/pitch each within 15 degrees of the neutral
+  head-pose baseline.
+- Each dot must pass gx and gy population standard deviation <= 0.02.
+  Unsteady dots show a warning and repeat. Up to three retries are allowed per
+  dot; a third failed retry aborts calibration.
+- Fits the existing six-term quadratic model using NumPy `lstsq`.
+- Reports mean predicted-position residual for each dot. Missing samples or
+  residual above 15% of screen diagonal mark that dot bad; only bad dots are
+  repeated, then the model and all residuals are recomputed.
+- After all dot residuals pass, presents five random verification points for
+  one second each. The fitted cursor is drawn live with current pixel error;
+  per-point and overall mean error are reported at the end. Verification passes
+  only if overall mean error is below 10% of screen diagonal.
+- Only after verification passes does it save coefficients with
+  `verified: true`, provided all nine dots passed steadiness. Missing, corrupt,
+  and unverified configs start calibration; future interaction stages must
+  require the verified marker.
+- Stage 3 live calibration and cursor direction verification remain pending.
+  Procedure: `STAGE_3.md`.
+
+## Validation
+- Tests cover landmark and gaze calculations, unchanged polynomial fit,
+  per-dot residual selection, pixel prediction, verification pass/fail, and
+  verified-config status.
+- Run `.venv\Scripts\python.exe -m unittest discover -s tests -v`.
 
 ## Current and next work
-- Current: run the Stage 1 live webcam acceptance check described in STAGE_1.md.
-- Next after Stage 1 passes: Stage 2 iris extraction and rough gaze-point output.
+- Current: user runs Stage 3, confirms residual handling and five-point cursor
+  verification, and checks top-left, center, and bottom-right direction.
+- If the cursor moves opposite to gaze, use live verification evidence to
+  diagnose the normalization/model sign convention; do not add another
+  pre-calibration matching gate.
+- Do not proceed to Stage 4+ until Stage 3 live verification passes.
 
-## Handoff guidance for future agents
-- Do not expand scope beyond the pinned spec.
-- Do not implement OS cursor control or cross-app interaction.
-- Keep all logic offline and CPU-only.
-- Update PROGRESS.md whenever a stage changes state.
-- Keep implementation within the current stage; do not proceed to Stage 2 before
-  Stage 1's live acceptance check passes.
-- If the environment breaks, recreate the venv from requirements.txt and re-test imports before moving on.
+## Handoff guidance
+- Keep behavior offline, CPU-only, and within the locked scope.
+- Update `PROGRESS.md` whenever stage status changes.
+- If the environment breaks, recreate `.venv` from `requirements.txt` and
+  validate imports/tests before proceeding.
