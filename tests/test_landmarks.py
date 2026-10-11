@@ -14,6 +14,7 @@ from main import (
     extract_iris_centers,
     fit_calibration,
     fit_mvp_calibration,
+    load_verified_calibration,
     calibration_acceptance_passed,
     calibration_config_status,
     calibration_frame_is_valid,
@@ -22,7 +23,11 @@ from main import (
     diagnosis_report,
     FACE_LANDMARK_INDICES,
     FACE_MODEL_POINTS,
+    OneEuroFilter,
     estimate_head_pose,
+    apply_cursor_dead_zone,
+    clamp_screen_position,
+    cursor_position_jump_exceeds_limit,
     bad_calibration_dots,
     gaze_is_steady,
     gaze_standard_deviation,
@@ -167,6 +172,75 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(len(x_coefficients), 6)
         self.assertEqual(len(y_coefficients), 6)
         self.assertAlmostEqual(error, 0.0)
+
+    def test_one_euro_filter_suppresses_jitter_and_adapts_to_motion(self) -> None:
+        adaptive = OneEuroFilter()
+        fixed = OneEuroFilter(beta=0.0)
+        self.assertEqual(adaptive.filter(100.0), 100.0)
+        self.assertEqual(fixed.filter(100.0), 100.0)
+
+        adaptive_values = [adaptive.filter(value) for value in (103.0, 97.0) * 10]
+        self.assertLess(max(adaptive_values) - min(adaptive_values), 6.0)
+
+        adaptive_motion = adaptive.filter(300.0)
+        fixed_motion = fixed.filter(300.0)
+        self.assertGreater(adaptive_motion, fixed_motion)
+
+    def test_one_euro_filter_requires_positive_frequency_and_cutoffs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            OneEuroFilter(freq=0.0)
+        with self.assertRaisesRegex(ValueError, "must not be negative"):
+            OneEuroFilter(beta=-0.1)
+
+    def test_one_euro_filter_reset_clears_all_state(self) -> None:
+        filter_ = OneEuroFilter()
+        filter_.filter(100.0)
+        filter_.filter(160.0)
+
+        filter_.reset()
+
+        self.assertIsNone(filter_.previous_raw)
+        self.assertIsNone(filter_.filtered_value)
+        self.assertEqual(filter_.filtered_derivative, 0.0)
+        self.assertEqual(filter_.filter(250.0), 250.0)
+
+    def test_clamp_screen_position_keeps_cursor_inside_screen_bounds(self) -> None:
+        self.assertEqual(
+            clamp_screen_position((-50.0, 700.0), (800, 600)),
+            (0.0, 600.0),
+        )
+        self.assertEqual(
+            clamp_screen_position((400.0, 300.0), (800, 600)),
+            (400.0, 300.0),
+        )
+
+    def test_large_raw_cursor_jumps_are_detected_for_filter_reset(self) -> None:
+        self.assertFalse(cursor_position_jump_exceeds_limit(None, (500.0, 500.0)))
+        self.assertFalse(
+            cursor_position_jump_exceeds_limit((0.0, 0.0), (400.0, 0.0))
+        )
+        self.assertTrue(
+            cursor_position_jump_exceeds_limit((0.0, 0.0), (401.0, 0.0))
+        )
+
+    def test_cursor_dead_zone_holds_drawn_position_until_twelve_pixels(self) -> None:
+        drawn = (100.0, 100.0)
+        self.assertEqual(apply_cursor_dead_zone(drawn, (107.0, 108.0)), drawn)
+        self.assertEqual(apply_cursor_dead_zone(drawn, (112.0, 100.0)), (112.0, 100.0))
+        self.assertEqual(apply_cursor_dead_zone(None, (20.0, 30.0)), (20.0, 30.0))
+
+    def test_load_verified_calibration_reads_coefficients_only_when_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            with patch("main.CALIBRATION_CONFIG", config_path):
+                save_calibration([1.0] * 6, [2.0] * 6, verified=True)
+                self.assertEqual(
+                    load_verified_calibration(),
+                    ([1.0] * 6, [2.0] * 6),
+                )
+                save_calibration([1.0] * 6, [2.0] * 6, verified=False)
+                with self.assertRaisesRegex(RuntimeError, "corrupt"):
+                    load_verified_calibration()
 
     def test_neutral_pose_uses_median_and_requires_ten_readings(self) -> None:
         samples = [(float(index), float(index + 2)) for index in range(10)]
@@ -474,6 +548,34 @@ class CalibrationErrorHandlingTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("Traceback (most recent call last)", stderr.getvalue())
         hold_screen.assert_called_once_with("camera failed")
+
+    def test_default_startup_rejects_missing_verified_calibration(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch("main.sys.argv", ["main.py"]),
+            patch(
+                "main.load_verified_calibration",
+                side_effect=RuntimeError("Calibration config is missing"),
+            ),
+            patch("main.run") as cursor_runner,
+            patch("main.sys.stderr", stderr),
+        ):
+            exit_code = main_entrypoint()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("Calibration config is missing", stderr.getvalue())
+        cursor_runner.assert_not_called()
+
+    def test_default_startup_runs_stage_four_with_verified_config(self) -> None:
+        with (
+            patch("main.sys.argv", ["main.py"]),
+            patch("main.load_verified_calibration", return_value=([1.0] * 6, [2.0] * 6)),
+            patch("main.run") as cursor_runner,
+        ):
+            exit_code = main_entrypoint()
+
+        self.assertEqual(exit_code, 0)
+        cursor_runner.assert_called_once_with(0)
 
 
 if __name__ == "__main__":

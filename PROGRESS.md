@@ -3,9 +3,9 @@
 - [x] Stage 1 — landmarks — PASS 2026-10-10 (live webcam acceptance confirmed)
 - [x] Stage 2 — iris — PASS 2026-10-10 (user confirmed directional values; raw jitter expected)
 - [ ] Stage 3 — forgiving MVP calibration — IN PROGRESS (live acceptance pending)
-- [x] Read-only `--diagnose` mode — IMPLEMENTED; 29 automated tests PASS (live
+- [x] Read-only `--diagnose` mode — IMPLEMENTED; automated tests PASS (live
   webcam acceptance pending)
-- [ ] Stage 4 — smoothing — PENDING
+- [ ] Stage 4 — cursor smoothing — IMPLEMENTED; live acceptance pending
 - [ ] Stage 5 — dwell — PENDING
 - [ ] Stage 6 — blink — PENDING
 - [ ] Stage 7 — scroll — PENDING
@@ -60,4 +60,6 @@
 ## Next work
 - Complete live Stage 3 and confirm 30 samples are collected per dot, the fit
   runs once, and a verified config is saved below the 20% error threshold.
-- Stage 4 cursor smoothing and interaction behavior are not implemented yet.
+- Run the Stage 4 acceptance check in `STAGE_4.md`. Do not proceed to Stage 5
+  until the cursor direction, smoothing, FPS, face-loss behavior, and clean
+  shutdown are confirmed live.

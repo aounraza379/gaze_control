@@ -16,7 +16,7 @@ facial landmarks. The app does not control the OS cursor or other applications.
 - Stage 2: iris — COMPLETE; user confirmed directional response; raw gaze is
   noisy and has small dynamic range
 - Stage 3: forgiving MVP calibration — IMPLEMENTED; live acceptance pending
-- Stage 4: smoothing — PENDING
+- Stage 4: cursor smoothing — IMPLEMENTED; live acceptance pending
 - Stage 5: dwell — PENDING
 - Stage 6: blink — PENDING
 - Stage 7: scroll — PENDING
@@ -65,9 +65,13 @@ facial landmarks. The app does not control the OS cursor or other applications.
   `.venv\Scripts\python.exe main.py --diagnose` after verified calibration.
   It reports mean predictions/errors at the nine grid positions and follows
   with 20 seconds of unfiltered free-look; it never recalibrates or saves.
-- Stage 4 cursor smoothing/interaction has not been implemented; there is no
-  cursor-smoothing screen that calibration transitions into yet.
-- Do not proceed to Stage 4+ until Stage 3 live calibration is confirmed.
+- Default `python main.py` now runs Stage 4, requiring verified calibration.
+  It maps normalized gaze through the saved fit, applies EMA alpha 0.30, and
+  draws an FPS counter and smoothed cursor. Face loss beyond five frames hides
+  the cursor and shows a warning. The earlier OpenCV preview is still
+  available via `--preview`.
+- Live Stage 4 acceptance is pending. Follow `STAGE_4.md`; do not begin Stage 5
+  until direction, smoothing, FPS, recovery, and shutdown are confirmed.
 
 ## Handoff guidance
 - Keep behavior offline, CPU-only, and within the locked scope.

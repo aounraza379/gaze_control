@@ -4,6 +4,7 @@ import math
 import random
 import sys
 import textwrap
+import time
 import traceback
 from collections.abc import Iterable
 from pathlib import Path
@@ -49,6 +50,13 @@ FACE_MODEL_POINTS = np.array(
 )
 FACE_LANDMARK_INDICES = (1, 152, 33, 263, 61, 291)
 CALIBRATION_CONFIG = Path(__file__).with_name("config.json")
+ONE_EURO_FREQUENCY = 30.0
+ONE_EURO_MIN_CUTOFF = 1.0
+ONE_EURO_BETA = 0.007
+ONE_EURO_D_CUTOFF = 1.0
+CURSOR_DEAD_ZONE_PIXELS = 12.0
+CURSOR_FILTER_RESET_JUMP_PIXELS = 400.0
+FACE_LOST_HIDE_FRAMES = 5
 
 
 def draw_landmarks(
@@ -334,6 +342,125 @@ def predict_screen_position(
     coefficients = np.column_stack((x_coefficients, y_coefficients))
     predicted = design @ coefficients
     return float(predicted[0]), float(predicted[1])
+
+
+class OneEuroFilter:
+    def __init__(
+        self,
+        freq: float = ONE_EURO_FREQUENCY,
+        mincutoff: float = ONE_EURO_MIN_CUTOFF,
+        beta: float = ONE_EURO_BETA,
+        dcutoff: float = ONE_EURO_D_CUTOFF,
+    ) -> None:
+        if freq <= 0.0 or mincutoff <= 0.0 or dcutoff <= 0.0:
+            raise ValueError("One Euro filter frequency and cutoffs must be positive.")
+        if beta < 0.0:
+            raise ValueError("One Euro filter beta must not be negative.")
+        self.freq = freq
+        self.mincutoff = mincutoff
+        self.beta = beta
+        self.dcutoff = dcutoff
+        self.previous_raw: float | None = None
+        self.filtered_derivative = 0.0
+        self.filtered_value: float | None = None
+
+    def _alpha(self, cutoff: float) -> float:
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        timestep = 1.0 / self.freq
+        return 1.0 / (1.0 + tau / timestep)
+
+    def reset(self) -> None:
+        self.previous_raw = None
+        self.filtered_derivative = 0.0
+        self.filtered_value = None
+
+    def filter(self, value: float) -> float:
+        if self.previous_raw is None or self.filtered_value is None:
+            self.previous_raw = value
+            self.filtered_value = value
+            return value
+
+        derivative = (value - self.previous_raw) * self.freq
+        derivative_alpha = self._alpha(self.dcutoff)
+        self.filtered_derivative = (
+            derivative_alpha * derivative
+            + (1.0 - derivative_alpha) * self.filtered_derivative
+        )
+        cutoff = self.mincutoff + self.beta * abs(self.filtered_derivative)
+        value_alpha = self._alpha(cutoff)
+        self.filtered_value = (
+            value_alpha * value + (1.0 - value_alpha) * self.filtered_value
+        )
+        self.previous_raw = value
+        return self.filtered_value
+
+
+def clamp_screen_position(
+    position: tuple[float, float],
+    screen_size: tuple[int, int],
+) -> tuple[float, float]:
+    width, height = screen_size
+    if width <= 0 or height <= 0:
+        raise ValueError("Screen dimensions must be positive.")
+    return (
+        min(max(position[0], 0.0), float(width)),
+        min(max(position[1], 0.0), float(height)),
+    )
+
+
+def cursor_position_jump_exceeds_limit(
+    previous: tuple[float, float] | None,
+    current: tuple[float, float],
+) -> bool:
+    return (
+        previous is not None
+        and math.dist(previous, current) > CURSOR_FILTER_RESET_JUMP_PIXELS
+    )
+
+
+def apply_cursor_dead_zone(
+    drawn: tuple[float, float] | None,
+    filtered: tuple[float, float],
+) -> tuple[float, float]:
+    if drawn is None or math.dist(drawn, filtered) >= CURSOR_DEAD_ZONE_PIXELS:
+        return filtered
+    return drawn
+
+
+def load_verified_calibration() -> tuple[list[float], list[float]]:
+    config_status = calibration_config_status()
+    if config_status != "valid":
+        raise RuntimeError(
+            f"Calibration config is {config_status}; run "
+            "'.\\.venv\\Scripts\\python.exe main.py --calibrate' and complete "
+            "calibration before starting cursor control."
+        )
+    try:
+        config = json.loads(CALIBRATION_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"Cannot load verified calibration config "
+            f"{CALIBRATION_CONFIG}: {error}"
+        ) from error
+    if not isinstance(config, dict) or config.get("verified") is not True:
+        raise RuntimeError(
+            f"Calibration config {CALIBRATION_CONFIG} is not verified."
+        )
+
+    x_coefficients = config.get("screen_x_coefficients")
+    y_coefficients = config.get("screen_y_coefficients")
+    if (
+        not isinstance(x_coefficients, list)
+        or not isinstance(y_coefficients, list)
+        or len(x_coefficients) != 6
+        or len(y_coefficients) != 6
+    ):
+        raise RuntimeError(
+            f"Calibration config {CALIBRATION_CONFIG} has invalid coefficients."
+        )
+    return [float(value) for value in x_coefficients], [
+        float(value) for value in y_coefficients
+    ]
 
 
 def per_dot_residuals(
@@ -1214,7 +1341,7 @@ def run_calibration(camera_index: int = 0) -> None:
         pygame.quit()
 
 
-def run(camera_index: int = 0) -> None:
+def run_preview(camera_index: int = 0) -> None:
     capture = cv2.VideoCapture(camera_index)
     if not capture.isOpened():
         capture.release()
@@ -1314,6 +1441,176 @@ def run(camera_index: int = 0) -> None:
     finally:
         capture.release()
         cv2.destroyAllWindows()
+
+
+def make_cursor_glow() -> pygame.Surface:
+    diameter = 48
+    center = (diameter // 2, diameter // 2)
+    glow = pygame.Surface((diameter, diameter), pygame.SRCALPHA)
+    for radius in range(21, 12, -1):
+        alpha = round(8 + (21 - radius) * 3)
+        pygame.draw.circle(glow, (90, 245, 180, alpha), center, radius, width=1)
+    pygame.draw.circle(glow, (120, 255, 195, 245), center, 12)
+    pygame.draw.circle(glow, (225, 255, 240, 255), center, 5)
+    return glow
+
+
+def run(camera_index: int = 0) -> None:
+    x_coefficients, y_coefficients = load_verified_calibration()
+    capture = cv2.VideoCapture(camera_index)
+    if not capture.isOpened():
+        capture.release()
+        raise RuntimeError(
+            f"Could not open camera {camera_index}. Check camera permissions, "
+            "close other camera apps, or try another --camera-index."
+        )
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    try:
+        pygame.init()
+        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        pygame.display.set_caption("Gaze Control")
+        clock = pygame.time.Clock()
+        hud_font = pygame.font.SysFont("consolas", 18)
+        status_font = pygame.font.Font(None, 32)
+        cursor_glow = make_cursor_glow()
+        width, height = screen.get_size()
+    except Exception:
+        capture.release()
+        pygame.quit()
+        raise
+    x_filter = OneEuroFilter()
+    y_filter = OneEuroFilter()
+    filtered_position: tuple[float, float] | None = None
+    drawn_position: tuple[float, float] | None = None
+    face_lost_frames = 0
+    running = True
+    last_console_log = time.monotonic()
+    latest_gaze_position: tuple[float, float] | None = None
+    raw_position: tuple[float, float] | None = None
+    previous_raw_position: tuple[float, float] | None = None
+
+    try:
+        with mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        ) as face_mesh:
+            while running:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT or (
+                        event.type == pygame.KEYDOWN
+                        and event.key in (pygame.K_q, pygame.K_ESCAPE)
+                    ):
+                        running = False
+                if not running:
+                    break
+
+                frame_ok, frame = capture.read()
+                if not frame_ok:
+                    raise RuntimeError("Failed to read a frame from the camera.")
+                result = face_mesh.process(
+                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                )
+                faces = result.multi_face_landmarks
+                latest_gaze_position = None
+                raw_position = None
+
+                if faces:
+                    if face_lost_frames > FACE_LOST_HIDE_FRAMES:
+                        x_filter.reset()
+                        y_filter.reset()
+                        filtered_position = None
+                        drawn_position = None
+                        previous_raw_position = None
+                    face_lost_frames = 0
+                    points = [
+                        (landmark.x, landmark.y)
+                        for landmark in faces[0].landmark
+                    ]
+                    if extract_iris_centers(points) is not None:
+                        gaze = normalized_gaze(
+                            points, (frame.shape[1], frame.shape[0])
+                        )
+                        if gaze is not None:
+                            predicted = predict_screen_position(
+                                gaze, x_coefficients, y_coefficients
+                            )
+                            raw_position = predicted
+                            if cursor_position_jump_exceeds_limit(
+                                previous_raw_position, raw_position
+                            ):
+                                x_filter.reset()
+                                y_filter.reset()
+                            previous_raw_position = raw_position
+                            filtered_position = (
+                                x_filter.filter(raw_position[0]),
+                                y_filter.filter(raw_position[1]),
+                            )
+                            bounded_position = clamp_screen_position(
+                                filtered_position, (width, height)
+                            )
+                            drawn_position = apply_cursor_dead_zone(
+                                drawn_position, bounded_position
+                            )
+                            latest_gaze_position = bounded_position
+                else:
+                    face_lost_frames += 1
+                    if face_lost_frames > FACE_LOST_HIDE_FRAMES:
+                        filtered_position = None
+                        drawn_position = None
+
+                screen.fill((12, 16, 26))
+                fps = clock.get_fps()
+                position_text = lambda position: (
+                    f"({position[0]:.1f},{position[1]:.1f})"
+                    if position is not None
+                    else "(n/a,n/a)"
+                )
+                hud_text = (
+                    f"raw: {position_text(raw_position)} | "
+                    f"filtered: {position_text(filtered_position)} | "
+                    f"drawn: {position_text(drawn_position)} | FPS: {fps:.1f}"
+                )
+                hud_surface = hud_font.render(hud_text, True, (220, 230, 240))
+                screen.blit(hud_surface, (16, 14))
+                if drawn_position is not None:
+                    screen.blit(
+                        cursor_glow,
+                        (
+                            round(drawn_position[0] - cursor_glow.get_width() / 2),
+                            round(drawn_position[1] - cursor_glow.get_height() / 2),
+                        ),
+                    )
+
+                if face_lost_frames > FACE_LOST_HIDE_FRAMES:
+                    face_message = status_font.render(
+                        "Face not detected", True, (255, 170, 150)
+                    )
+                    screen.blit(
+                        face_message,
+                        face_message.get_rect(center=(width // 2, 28)),
+                    )
+
+                pygame.display.flip()
+                clock.tick(60)
+
+                now = time.monotonic()
+                if now - last_console_log >= 1.0:
+                    gaze_text = (
+                        f"({latest_gaze_position[0]:.1f}, "
+                        f"{latest_gaze_position[1]:.1f})"
+                        if latest_gaze_position is not None
+                        else "(n/a, n/a)"
+                    )
+                    print(f"FPS: {clock.get_fps():.1f} | gaze: {gaze_text}", flush=True)
+                    last_console_log = now
+    finally:
+        capture.release()
+        pygame.quit()
 
 
 def diagnosis_report(
@@ -1769,6 +2066,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if not (args.diagnose or args.calibrate or args.preview):
+        try:
+            load_verified_calibration()
+        except (OSError, RuntimeError) as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 1
+
     keep_error_window = not args.diagnose
     try:
         if args.diagnose:
@@ -1776,18 +2080,9 @@ def main() -> int:
         elif args.calibrate:
             run_calibration(args.camera_index)
         elif args.preview:
-            run(args.camera_index)
+            run_preview(args.camera_index)
         else:
-            config_status = calibration_config_status()
-            if config_status != "valid":
-                keep_error_window = True
-                print(
-                    f"Calibration config is {config_status}; starting calibration.",
-                    file=sys.stderr,
-                )
-                run_calibration(args.camera_index)
-            else:
-                run(args.camera_index)
+            run(args.camera_index)
     except Exception as error:
         traceback.print_exc()
         if keep_error_window:
