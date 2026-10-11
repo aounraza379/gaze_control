@@ -3,6 +3,8 @@ import json
 import math
 import random
 import sys
+import textwrap
+import traceback
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -17,6 +19,10 @@ EYE_LANDMARKS = (
     (362, 263, 386, 374, 473),
 )
 MIN_EYE_OPENING_RATIO = 0.08
+MIN_CALIBRATION_EAR = 0.15
+CALIBRATION_SAMPLES_PER_DOT = 30
+CALIBRATION_DOT_TIMEOUT_SECONDS = 20.0
+CALIBRATION_ERROR_LIMIT = 0.20
 NEUTRAL_POSE_CAPTURE_SECONDS = 2.0
 MIN_NEUTRAL_POSE_SAMPLES = 10
 CALIBRATION_DOT_RESIDUAL_LIMIT = 0.15
@@ -156,34 +162,25 @@ def eye_aspect_ratio(
     return sum(eye_ratios) / len(eye_ratios)
 
 
-def calibration_sample_rejection_reason(
+def calibration_frame_is_valid(
+    face_detected: bool,
     gaze: tuple[float, float] | None,
     ear: float | None,
-    pose: tuple[float, float] | None,
-    pose_baseline: tuple[float, float] | None = None,
-) -> str | None:
-    reasons: list[str] = []
-    if gaze is None:
-        reasons.append("gaze unavailable")
-    if ear is None:
-        reasons.append("EAR unavailable")
-    elif ear <= 0.25:
-        reasons.append(f"EAR {ear:.2f} <= 0.25")
-    if pose is None:
-        reasons.append("head pose unavailable")
-    elif pose_baseline is None:
-        reasons.append("neutral head position not captured")
-    else:
-        yaw, pitch = relative_head_pose(pose, pose_baseline)
-        if abs(yaw) >= 15:
-            reasons.append(f"yaw {yaw:+.1f} >= 15 deg" if yaw >= 0 else f"yaw {yaw:.1f} <= -15 deg")
-        if abs(pitch) >= 15:
-            reasons.append(
-                f"pitch {pitch:+.1f} >= 15 deg"
-                if pitch >= 0
-                else f"pitch {pitch:.1f} <= -15 deg"
-            )
-    return "; ".join(reasons) if reasons else None
+) -> bool:
+    return (
+        face_detected
+        and gaze is not None
+        and ear is not None
+        and ear > MIN_CALIBRATION_EAR
+    )
+
+
+def calibration_mvp_passed(mean_error: float | None) -> bool:
+    return (
+        mean_error is not None
+        and math.isfinite(mean_error)
+        and mean_error < CALIBRATION_ERROR_LIMIT
+    )
 
 
 def relative_head_pose(
@@ -293,6 +290,39 @@ def mean_2d_error(
     return float(np.linalg.norm(predicted - actual, axis=1).mean()) / math.hypot(
         width, height
     )
+
+
+def fit_mvp_calibration(
+    dot_gaze_samples: list[list[tuple[float, float]]],
+    target_positions: list[tuple[int, int]],
+    screen_size: tuple[int, int],
+) -> tuple[list[float], list[float], float]:
+    if len(dot_gaze_samples) != len(target_positions):
+        raise ValueError("Each calibration target needs one sample bucket.")
+    if any(not samples for samples in dot_gaze_samples):
+        raise ValueError("Every calibration target needs valid gaze samples.")
+
+    gaze_samples = [
+        gaze
+        for samples_for_dot in dot_gaze_samples
+        for gaze in samples_for_dot
+    ]
+    screen_samples = [
+        (float(target[0]), float(target[1]))
+        for samples_for_dot, target in zip(dot_gaze_samples, target_positions)
+        for _ in samples_for_dot
+    ]
+    x_coefficients, y_coefficients = fit_calibration(
+        gaze_samples, screen_samples
+    )
+    error = mean_2d_error(
+        gaze_samples,
+        screen_samples,
+        x_coefficients,
+        y_coefficients,
+        screen_size,
+    )
+    return x_coefficients, y_coefficients, error
 
 
 def predict_screen_position(
@@ -601,27 +631,27 @@ def run_calibration(camera_index: int = 0) -> None:
     dot_gaze_samples: list[list[tuple[float, float]]] = [
         [] for _ in target_positions
     ]
-    active_target_indices = list(range(len(target_positions)))
-    target_queue_index = 0
-    target_index = active_target_indices[target_queue_index]
+    target_index = 0
     phase_started = pygame.time.get_ticks() / 1000
-    phase = "baseline_settle"
+    phase = "countdown"
     point_samples = 0
     pose_baseline: tuple[float, float] | None = None
-    baseline_pose_samples: list[tuple[float, float]] = []
-    dot_retry_counts = [0 for _ in target_positions]
-    dot_steadiness_passed = [False for _ in target_positions]
     x_coefficients: list[float] | None = None
     y_coefficients: list[float] | None = None
     fit_error: float | None = None
+    predicted_cursor: tuple[float, float] | None = None
+    current_verification_error: float | None = None
     verification_targets: list[tuple[int, int]] = []
     verification_errors: list[list[float]] = []
     verification_index = 0
     verification_mean: float | None = None
     calibration_residuals: list[float | None] = []
     pending_bad_dots: list[int] = []
+    dot_steadiness_passed = [True for _ in target_positions]
+    pose: tuple[float, float] | None = None
     fit_failure_reason: str | None = None
     calibration_cycle = 1
+    retry_button = pygame.Rect(width // 2 - 130, height // 2 + 55, 260, 54)
     finished = False
     try:
         with mp.solutions.face_mesh.FaceMesh(
@@ -637,63 +667,44 @@ def run_calibration(camera_index: int = 0) -> None:
                 valid_sample = False
                 face_detected = False
                 gaze: tuple[float, float] | None = None
-                predicted_cursor: tuple[float, float] | None = None
-                current_verification_error: float | None = None
                 ear: float | None = None
-                pose: tuple[float, float] | None = None
-                frame_ok, frame = capture.read()
-                if not frame_ok:
-                    raise RuntimeError("Failed to read a frame from the camera.")
+                if phase not in (
+                    "calibration_result",
+                    "calibration_failed",
+                    "collection_timeout",
+                ):
+                    frame_ok, frame = capture.read()
+                    if not frame_ok:
+                        raise RuntimeError("Failed to read a frame from the camera.")
 
-                result = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                faces = result.multi_face_landmarks
-                if faces:
-                    face_detected = True
-                    points = [
-                        (landmark.x, landmark.y) for landmark in faces[0].landmark
-                    ]
-                    gaze = normalized_gaze(points, (frame.shape[1], frame.shape[0]))
-                    ear = eye_aspect_ratio(points, (frame.shape[1], frame.shape[0]))
-                    pose = estimate_head_pose(
-                        points, (frame.shape[1], frame.shape[0])
+                    result = face_mesh.process(
+                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     )
-                    if phase == "baseline" and pose is not None:
-                        baseline_pose_samples.append(pose)
-                    if phase not in ("baseline_settle", "baseline"):
-                        valid_sample = (
-                            calibration_sample_rejection_reason(
-                                gaze, ear, pose, pose_baseline
-                            )
-                            is None
-                        )
-                    if (
-                        valid_sample
-                        and gaze is not None
-                        and phase == "collect"
-                        and elapsed < 1.0
-                    ):
-                        dot_gaze_samples[target_index].append(gaze)
-                        point_samples += 1
-                    if (
-                        valid_sample
-                        and gaze is not None
-                        and phase == "verification"
-                        and x_coefficients is not None
-                        and y_coefficients is not None
-                    ):
-                        predicted_cursor = predict_screen_position(
-                            gaze, x_coefficients, y_coefficients
-                        )
-                        verification_target = verification_targets[
-                            verification_index
+                    faces = result.multi_face_landmarks
+                    if faces:
+                        face_detected = True
+                        points = [
+                            (landmark.x, landmark.y)
+                            for landmark in faces[0].landmark
                         ]
-                        current_verification_error = math.dist(
-                            predicted_cursor, verification_target
+                        gaze = normalized_gaze(
+                            points, (frame.shape[1], frame.shape[0])
                         )
-                        if elapsed < VERIFICATION_DURATION_SECONDS:
-                            verification_errors[verification_index].append(
-                                current_verification_error
-                            )
+                        ear = eye_aspect_ratio(
+                            points, (frame.shape[1], frame.shape[0])
+                        )
+                        valid_sample = calibration_frame_is_valid(
+                            face_detected, gaze, ear
+                        )
+                        if phase == "collect" and valid_sample and gaze is not None:
+                            if len(dot_gaze_samples[target_index]) < CALIBRATION_SAMPLES_PER_DOT:
+                                dot_gaze_samples[target_index].append(gaze)
+                                point_samples = len(dot_gaze_samples[target_index])
+                                print(
+                                    f"Collected frame {point_samples} for dot "
+                                    f"{target_index + 1}/{len(target_positions)}",
+                                    flush=True,
+                                )
 
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT or (
@@ -702,224 +713,170 @@ def run_calibration(camera_index: int = 0) -> None:
                     ):
                         finished = True
                     elif (
-                        phase in ("fit_failed", "verification_result")
-                        and event.type == pygame.KEYDOWN
-                        and event.key == pygame.K_r
-                        and not (
-                            phase == "verification_result"
-                            and calibration_acceptance_passed(
-                                dot_steadiness_passed,
-                                verification_mean,
-                                (width, height),
-                            )
-                        )
+                        event.type == pygame.MOUSEBUTTONUP
+                        and event.button == 1
+                        and phase in ("collection_timeout", "calibration_failed")
+                        and retry_button.collidepoint(event.pos)
                     ):
-                        calibration_cycle += 1
-                        dot_gaze_samples = [[] for _ in target_positions]
-                        active_target_indices = list(range(len(target_positions)))
-                        target_queue_index = 0
-                        target_index = active_target_indices[target_queue_index]
-                        point_samples = 0
-                        pose_baseline = None
-                        baseline_pose_samples.clear()
-                        dot_retry_counts = [0 for _ in target_positions]
-                        dot_steadiness_passed = [False for _ in target_positions]
-                        x_coefficients = None
-                        y_coefficients = None
-                        fit_error = None
-                        verification_targets = []
-                        verification_errors = []
-                        verification_index = 0
-                        verification_mean = None
-                        calibration_residuals = []
-                        pending_bad_dots = []
+                        if phase == "collection_timeout":
+                            dot_gaze_samples[target_index] = []
+                            point_samples = 0
+                        else:
+                            calibration_cycle += 1
+                            dot_gaze_samples = [[] for _ in target_positions]
+                            target_index = 0
                         fit_failure_reason = None
-                        phase = "baseline_settle"
-                        phase_started = now
-                        elapsed = 0.0
-
-                if phase == "baseline_settle" and elapsed >= 0.5:
-                    phase = "baseline"
-                    phase_started = now
-                    elapsed = 0.0
-                elif phase == "baseline" and elapsed >= NEUTRAL_POSE_CAPTURE_SECONDS:
-                    pose_baseline = median_head_pose(baseline_pose_samples)
-                    if pose_baseline is not None:
+                        fit_error = None
                         phase = "countdown"
                         phase_started = now
                         elapsed = 0.0
-                    else:
-                        baseline_pose_samples.clear()
-                        phase_started = now
-                        elapsed = 0.0
-                elif phase == "countdown" and elapsed >= DOT_COUNTDOWN_SECONDS:
+
+                if phase == "countdown" and elapsed >= DOT_COUNTDOWN_SECONDS:
                     phase = "collect"
                     dot_gaze_samples[target_index] = []
                     point_samples = 0
                     phase_started = now
                     elapsed = 0.0
-                elif phase == "collect" and elapsed >= 1.0:
-                    if not gaze_is_steady(dot_gaze_samples[target_index]):
-                        retry_count = next_dot_retry_count(
-                            dot_retry_counts[target_index]
+                elif phase == "collect":
+                    point_samples = len(dot_gaze_samples[target_index])
+                    if point_samples >= CALIBRATION_SAMPLES_PER_DOT:
+                        print(
+                            f"Completed dot {target_index + 1}/"
+                            f"{len(target_positions)}",
+                            flush=True,
                         )
-                        if retry_count is None:
-                            phase = "retry_limit_failed"
-                        else:
-                            dot_retry_counts[target_index] = retry_count
-                            dot_steadiness_passed[target_index] = False
-                            phase = "steadiness_retry_notice"
-                        phase_started = now
-                        elapsed = 0.0
-                    else:
-                        dot_steadiness_passed[target_index] = True
-                        target_queue_index += 1
                         point_samples = 0
-                        if target_queue_index < len(active_target_indices):
-                            target_index = active_target_indices[target_queue_index]
+                        if target_index + 1 < len(target_positions):
+                            target_index += 1
                             phase = "countdown"
                             phase_started = now
-                            elapsed = 0.0
                         else:
-                            all_gaze_samples = [
-                                sample
-                                for samples_for_dot in dot_gaze_samples
-                                for sample in samples_for_dot
-                            ]
-                            all_screen_samples = [
-                                (float(target[0]), float(target[1]))
-                                for samples_for_dot, target in zip(
-                                    dot_gaze_samples, target_positions
-                                )
-                                for _ in samples_for_dot
-                            ]
                             try:
-                                x_coefficients, y_coefficients = fit_calibration(
-                                    all_gaze_samples, all_screen_samples
+                                print(
+                                    "Fitting calibration once using all nine dots.",
+                                    flush=True,
                                 )
-                                residuals = per_dot_residuals(
+                                (
+                                    x_coefficients,
+                                    y_coefficients,
+                                    fit_error,
+                                ) = fit_mvp_calibration(
                                     dot_gaze_samples,
                                     target_positions,
-                                    x_coefficients,
-                                    y_coefficients,
-                                )
-                                bad_dots = bad_calibration_dots(
-                                    residuals, (width, height)
-                                )
-                                fit_error = mean_2d_error(
-                                    all_gaze_samples,
-                                    all_screen_samples,
-                                    x_coefficients,
-                                    y_coefficients,
                                     (width, height),
                                 )
                             except ValueError as error:
                                 fit_failure_reason = str(error)
-                                phase = "fit_failed"
-                                phase_started = now
+                                phase = "calibration_failed"
                             else:
-                                calibration_residuals = residuals
-                                pending_bad_dots = bad_dots
-                                phase = "residual_report"
-                                phase_started = now
-                        elapsed = 0.0
-                elif (
-                    phase == "steadiness_retry_notice"
-                    and elapsed >= STEADINESS_WARNING_SECONDS
-                ):
-                    dot_gaze_samples[target_index] = []
-                    point_samples = 0
-                    phase = "countdown"
-                    phase_started = now
-                    elapsed = 0.0
-                elif phase == "residual_report" and elapsed >= 3.0:
-                    if pending_bad_dots:
-                        for bad_dot in pending_bad_dots:
-                            dot_steadiness_passed[bad_dot] = False
-                        active_target_indices = pending_bad_dots
-                        target_queue_index = 0
-                        target_index = active_target_indices[0]
-                        phase = "countdown"
-                    elif all(dot_steadiness_passed):
-                        verification_targets = verification_points((width, height))
-                        verification_errors = [[] for _ in verification_targets]
-                        verification_index = 0
-                        phase = "verification"
-                    else:
-                        fit_failure_reason = (
-                            "Every calibration dot must pass gaze steadiness."
-                        )
-                        phase = "fit_failed"
-                    phase_started = now
-                    elapsed = 0.0
-                elif (
-                    phase == "verification"
-                    and elapsed >= VERIFICATION_DURATION_SECONDS
-                ):
-                    verification_index += 1
-                    if verification_index < len(verification_targets):
-                        phase_started = now
-                    else:
-                        verification_mean = verification_mean_error(
-                            error
-                            for point_errors in verification_errors
-                            for error in point_errors
-                        )
-                        phase = "verification_result"
-                        phase_started = now
-                        if calibration_acceptance_passed(
-                            dot_steadiness_passed,
-                            verification_mean,
-                            (width, height),
-                        ):
-                            if x_coefficients is None or y_coefficients is None:
-                                raise RuntimeError(
-                                    "Verified calibration coefficients are unavailable."
+                                print(
+                                    f"Calibration mean error: {fit_error:.1%} "
+                                    "(limit: <20% of screen diagonal)",
+                                    flush=True,
                                 )
-                            save_calibration(
-                                x_coefficients,
-                                y_coefficients,
-                                verified=True,
-                            )
+                                if calibration_mvp_passed(fit_error):
+                                    if (
+                                        x_coefficients is None
+                                        or y_coefficients is None
+                                    ):
+                                        raise RuntimeError(
+                                            "Calibration coefficients are unavailable."
+                                        )
+                                    save_calibration(
+                                        x_coefficients,
+                                        y_coefficients,
+                                        verified=True,
+                                    )
+                                    print(
+                                        "Calibration passed and config.json was saved.",
+                                        flush=True,
+                                    )
+                                    phase = "calibration_result"
+                                else:
+                                    fit_failure_reason = (
+                                        "Average fit error was not below 20% "
+                                        "of the screen diagonal."
+                                    )
+                                    phase = "calibration_failed"
+                            phase_started = now
+                    elif elapsed >= CALIBRATION_DOT_TIMEOUT_SECONDS:
+                        fit_failure_reason = (
+                            f"Could not collect {CALIBRATION_SAMPLES_PER_DOT} "
+                            f"valid frames for dot {target_index + 1} within "
+                            f"{CALIBRATION_DOT_TIMEOUT_SECONDS:.0f} seconds."
+                        )
+                        phase = "collection_timeout"
+                        phase_started = now
 
                 screen.fill((15, 18, 28))
                 title = font.render("Gaze Calibration", True, (235, 239, 250))
                 screen.blit(title, title.get_rect(center=(width // 2, 42)))
-                if phase in ("baseline_settle", "baseline"):
-                    pygame.draw.circle(screen, (70, 190, 255),
-                                       (width // 2, height // 2), 14)
-                    pygame.draw.circle(screen, (235, 245, 255),
-                                       (width // 2, height // 2), 4)
-                    baseline_text = (
-                        "Look at the center dot and sit naturally."
-                        if phase == "baseline_settle"
-                        else "Hold your natural head position steady."
+                if phase in (
+                    "calibration_result",
+                    "calibration_failed",
+                    "collection_timeout",
+                ):
+                    if phase == "calibration_result":
+                        result_title = "Calibration complete and saved"
+                        result_detail = (
+                            f"Mean fit error: {fit_error:.1%} of screen diagonal"
+                            if fit_error is not None
+                            else "Mean fit error unavailable"
+                        )
+                        result_color = (120, 235, 160)
+                    else:
+                        result_title = (
+                            "Calibration Failed, please try again"
+                            if phase == "calibration_failed"
+                            else "Could not collect enough valid gaze frames"
+                        )
+                        result_detail = fit_failure_reason or ""
+                        result_color = (255, 145, 135)
+                    screen.blit(
+                        font.render(result_title, True, result_color),
+                        font.render(result_title, True, result_color).get_rect(
+                            center=(width // 2, height // 2 - 45)
+                        ),
+                    )
+                    detail = small_font.render(
+                        result_detail, True, (220, 225, 235)
                     )
                     screen.blit(
-                        small_font.render(baseline_text, True, (195, 204, 220)),
-                        (24, 60),
+                        detail,
+                        detail.get_rect(center=(width // 2, height // 2 + 5)),
                     )
-                    if phase == "baseline":
-                        baseline_count = small_font.render(
-                            f"Valid head-pose readings: "
-                            f"{len(baseline_pose_samples)}/"
-                            f"{MIN_NEUTRAL_POSE_SAMPLES}",
-                            True,
-                            (195, 204, 220),
+                    if phase != "calibration_result":
+                        pygame.draw.rect(
+                            screen, (50, 125, 190), retry_button, border_radius=8
                         )
-                        screen.blit(baseline_count, (24, 92))
-                elif phase in ("countdown", "collect", "steadiness_retry_notice"):
+                        button_text = (
+                            "Retry this dot"
+                            if phase == "collection_timeout"
+                            else "Retry calibration"
+                        )
+                        rendered_button = small_font.render(
+                            button_text, True, (255, 255, 255)
+                        )
+                        screen.blit(
+                            rendered_button,
+                            rendered_button.get_rect(center=retry_button.center),
+                        )
+                    else:
+                        screen.blit(
+                            small_font.render(
+                                "Press Q or Esc to close.", True, (195, 204, 220)
+                            ),
+                            small_font.render(
+                                "Press Q or Esc to close.", True, (195, 204, 220)
+                            ).get_rect(center=(width // 2, height // 2 + 70)),
+                        )
+                elif phase in ("countdown", "collect"):
                     pygame.draw.circle(
                         screen, (70, 190, 255), target_positions[target_index], 14
                     )
                     pygame.draw.circle(screen, (235, 245, 255),
                                        target_positions[target_index], 4)
-                    retrying = len(active_target_indices) < len(target_positions)
-                    progress = (
-                        f"Redo target {target_index + 1}/9"
-                        if retrying
-                        else f"Target {target_index + 1}/9"
-                    )
+                    progress = f"Target {target_index + 1}/9"
                     screen.blit(
                         small_font.render(progress, True, (235, 239, 250)),
                         (24, 28),
@@ -944,19 +901,17 @@ def run_calibration(camera_index: int = 0) -> None:
                                 center=target_positions[target_index]
                             ),
                         )
-                        notice = "Look at this dot and hold your gaze steady."
-                    elif phase == "steadiness_retry_notice":
-                        notice = (
-                            "Gaze was not steady — holding this dot again."
-                        )
+                        notice = "Look at the target. Collection starts after countdown."
                     else:
-                        notice = "Sampling gaze for 1 second..."
+                        notice = (
+                            f"Collecting: {point_samples}/"
+                            f"{CALIBRATION_SAMPLES_PER_DOT} valid frames "
+                            f"({max(0, int(CALIBRATION_DOT_TIMEOUT_SECONDS - elapsed))}s)"
+                        )
                     notice_surface = small_font.render(
                         notice,
                         True,
-                        (255, 145, 135)
-                        if phase == "steadiness_retry_notice"
-                        else (195, 204, 220),
+                        (195, 204, 220),
                     )
                     notice_y = min(
                         height - notice_surface.get_height() - 12,
@@ -975,21 +930,44 @@ def run_calibration(camera_index: int = 0) -> None:
                             center=(notice_x, notice_y)
                         ),
                     )
-                    draw_calibration_hud(
+                    bar_width = min(420, width - 60)
+                    bar_rect = pygame.Rect(
+                        (width - bar_width) // 2, height - 75, bar_width, 20
+                    )
+                    pygame.draw.rect(
+                        screen, (65, 75, 95), bar_rect, border_radius=8
+                    )
+                    pygame.draw.rect(
                         screen,
-                        target_positions[target_index],
-                        (width, height),
-                        face_detected,
-                        gaze,
-                        ear,
-                        pose,
-                        pose_baseline,
-                        valid_sample,
-                        phase,
-                        elapsed,
-                        point_samples,
-                        hud_title_font,
-                        hud_body_font,
+                        (90, 205, 150),
+                        pygame.Rect(
+                            bar_rect.x,
+                            bar_rect.y,
+                            round(
+                                bar_width
+                                * point_samples
+                                / CALIBRATION_SAMPLES_PER_DOT
+                            ),
+                            bar_rect.height,
+                        ),
+                        border_radius=8,
+                    )
+                    sensor_text = (
+                        "Face and eyes ready"
+                        if valid_sample
+                        else (
+                            "Looking for face, visible gaze, and open eyes"
+                            if phase == "collect"
+                            else " "
+                        )
+                    )
+                    screen.blit(
+                        small_font.render(
+                            sensor_text, True, (195, 204, 220)
+                        ),
+                        small_font.render(
+                            sensor_text, True, (195, 204, 220)
+                        ).get_rect(center=(width // 2, height - 105)),
                     )
                 elif phase == "residual_report":
                     report_title = (
@@ -1338,9 +1316,435 @@ def run(camera_index: int = 0) -> None:
         cv2.destroyAllWindows()
 
 
+def diagnosis_report(
+    targets: list[tuple[int, int]],
+    predicted_positions: list[tuple[float, float] | None],
+    screen_size: tuple[int, int],
+) -> tuple[list[str], float | None, float | None, float | None]:
+    if len(targets) != len(predicted_positions):
+        raise ValueError("Diagnosis needs one predicted position per target.")
+    width, height = screen_size
+    if width <= 0 or height <= 0:
+        raise ValueError("Screen dimensions must be positive.")
+
+    diagonal = math.hypot(width, height)
+    rows = [
+        f"{'Target':<14}{'Predicted':<16}{'Error(px)':<12}Error(% diag)"
+    ]
+    errors: list[float] = []
+    x_biases: list[float] = []
+    y_biases: list[float] = []
+    for target, predicted in zip(targets, predicted_positions):
+        if predicted is None:
+            rows.append(f"{str(target):<14}{'N/A':<16}{'N/A':<12}N/A")
+            continue
+        error = math.dist(predicted, target)
+        errors.append(error)
+        x_biases.append(predicted[0] - target[0])
+        y_biases.append(predicted[1] - target[1])
+        rows.append(
+            f"{str(target):<14}"
+            f"{f'({predicted[0]:.0f}, {predicted[1]:.0f})':<16}"
+            f"{error:<12.0f}{error / diagonal:.1%}"
+        )
+
+    mean_error = verification_mean_error(errors)
+    x_bias = verification_mean_error(x_biases)
+    y_bias = verification_mean_error(y_biases)
+    rows.append("")
+    rows.append(
+        f"Mean error: {mean_error:.0f} px   "
+        f"({mean_error / diagonal:.1%} of diagonal)"
+        if mean_error is not None
+        else "Mean error: N/A (no valid gaze samples)"
+    )
+    rows.append(
+        f"X-axis bias: {x_bias:+.0f} px  "
+        "(predicted-right of target on average)"
+        if x_bias is not None
+        else "X-axis bias: N/A"
+    )
+    rows.append(
+        f"Y-axis bias: {y_bias:+.0f} px  "
+        "(positive is below target; negative is above)"
+        if y_bias is not None
+        else "Y-axis bias: N/A"
+    )
+    return rows, mean_error, x_bias, y_bias
+
+
+def run_diagnose(camera_index: int = 0) -> None:
+    try:
+        config_status = calibration_config_status()
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot read calibration config {CALIBRATION_CONFIG}: {error}"
+        ) from error
+    if config_status == "missing":
+        raise RuntimeError(
+            "Cannot run --diagnose: calibration config is missing. "
+            "Run --calibrate and complete cursor verification first."
+        )
+    try:
+        config = json.loads(CALIBRATION_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"Cannot read calibration config {CALIBRATION_CONFIG}: {error}"
+        ) from error
+    if not isinstance(config, dict):
+        raise RuntimeError(
+            f"Cannot run --diagnose: calibration config {CALIBRATION_CONFIG} "
+            "is corrupt."
+        )
+    if config.get("verified") is not True:
+        raise RuntimeError(
+            "Cannot run --diagnose: calibration config is unverified. "
+            "Run --calibrate and complete cursor verification first."
+        )
+    if config_status != "valid":
+        raise RuntimeError(
+            f"Cannot run --diagnose: calibration config is {config_status} "
+            "or has invalid coefficient data."
+        )
+    x_coefficients = config["screen_x_coefficients"]
+    y_coefficients = config["screen_y_coefficients"]
+
+    capture = cv2.VideoCapture(camera_index)
+    if not capture.isOpened():
+        capture.release()
+        raise RuntimeError(
+            f"Could not open camera {camera_index}. Check camera permissions, "
+            "close other camera apps, or try another --camera-index."
+        )
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    try:
+        pygame.init()
+        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        pygame.display.set_caption("Gaze Control Diagnosis")
+        clock = pygame.time.Clock()
+        title_font = pygame.font.Font(None, 42)
+        body_font = pygame.font.Font(None, 27)
+        small_font = pygame.font.Font(None, 21)
+        width, height = screen.get_size()
+    except Exception:
+        capture.release()
+        pygame.quit()
+        raise
+
+    targets = [
+        (round(width * x), round(height * y))
+        for y in (0.1, 0.5, 0.9)
+        for x in (0.1, 0.5, 0.9)
+    ]
+    predicted_positions: list[tuple[float, float] | None] = []
+    was_cancelled = False
+    try:
+        with mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        ) as face_mesh:
+            for target_index, target in enumerate(targets):
+                target_samples: list[tuple[float, float]] = []
+                phase = "countdown"
+                phase_started = pygame.time.get_ticks() / 1000
+                while phase != "done":
+                    now = pygame.time.get_ticks() / 1000
+                    phase_elapsed = now - phase_started
+                    predicted: tuple[float, float] | None = None
+                    frame_ok, frame = capture.read()
+                    if not frame_ok:
+                        raise RuntimeError("Failed to read a frame from the camera.")
+                    result = face_mesh.process(
+                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    )
+                    faces = result.multi_face_landmarks
+                    if (
+                        phase == "sample"
+                        and faces
+                    ):
+                        points = [
+                            (landmark.x, landmark.y)
+                            for landmark in faces[0].landmark
+                        ]
+                        gaze = normalized_gaze(
+                            points, (frame.shape[1], frame.shape[0])
+                        )
+                        if gaze is not None:
+                            predicted = predict_screen_position(
+                                gaze, x_coefficients, y_coefficients
+                            )
+                            if phase_elapsed < 2.0:
+                                target_samples.append(predicted)
+
+                    for event in pygame.event.get():
+                        if event.type == pygame.QUIT or (
+                            event.type == pygame.KEYDOWN
+                            and event.key in (pygame.K_ESCAPE, pygame.K_q)
+                        ):
+                            was_cancelled = True
+                            phase = "done"
+
+                    if phase == "countdown" and phase_elapsed >= 3.0:
+                        phase = "sample"
+                        phase_started = now
+                    elif phase == "sample" and phase_elapsed >= 2.0:
+                        predicted_positions.append(
+                            (
+                                sum(position[0] for position in target_samples)
+                                / len(target_samples),
+                                sum(position[1] for position in target_samples)
+                                / len(target_samples),
+                            )
+                            if target_samples
+                            else None
+                        )
+                        phase = "done"
+
+                    screen.fill((12, 16, 26))
+                    pygame.draw.circle(screen, (80, 190, 255), target, 16, width=2)
+                    pygame.draw.circle(screen, (235, 245, 255), target, 4)
+                    title = title_font.render(
+                        f"Diagnosis target {target_index + 1}/9",
+                        True,
+                        (235, 239, 250),
+                    )
+                    screen.blit(title, title.get_rect(center=(width // 2, 48)))
+                    if phase == "countdown":
+                        number = countdown_number(phase_elapsed)
+                        pulse = 1.0 + 0.12 * abs(math.sin(now * math.pi))
+                        rendered_number = title_font.render(
+                            str(number), True, (255, 245, 210)
+                        )
+                        rendered_number = pygame.transform.smoothscale(
+                            rendered_number,
+                            (
+                                round(rendered_number.get_width() * pulse),
+                                round(rendered_number.get_height() * pulse),
+                            ),
+                        )
+                        screen.blit(
+                            rendered_number,
+                            rendered_number.get_rect(center=target),
+                        )
+                        instruction = (
+                            "Look at the target; sampling begins after countdown."
+                        )
+                    else:
+                        instruction = (
+                            f"Sampling predicted cursor: "
+                            f"{max(0.0, 2.0 - phase_elapsed):.1f}s"
+                        )
+                    screen.blit(
+                        body_font.render(instruction, True, (195, 204, 220)),
+                        body_font.render(instruction, True, (195, 204, 220))
+                        .get_rect(center=(width // 2, height - 60)),
+                    )
+                    if predicted is not None:
+                        cursor = (
+                            min(max(round(predicted[0]), 0), width - 1),
+                            min(max(round(predicted[1]), 0), height - 1),
+                        )
+                        pygame.draw.circle(
+                            screen, (110, 255, 165), cursor, 10, width=2
+                        )
+                        pygame.draw.line(
+                            screen,
+                            (110, 255, 165),
+                            (cursor[0] - 7, cursor[1]),
+                            (cursor[0] + 7, cursor[1]),
+                            2,
+                        )
+                        pygame.draw.line(
+                            screen,
+                            (110, 255, 165),
+                            (cursor[0], cursor[1] - 7),
+                            (cursor[0], cursor[1] + 7),
+                            2,
+                        )
+                    pygame.display.flip()
+                    clock.tick(30)
+                    if was_cancelled:
+                        break
+                if was_cancelled:
+                    break
+
+            if not was_cancelled:
+                report, _, _, _ = diagnosis_report(
+                    targets, predicted_positions, (width, height)
+                )
+                print("\n".join(report))
+                report_started = pygame.time.get_ticks() / 1000
+                report_font = pygame.font.Font(None, 22)
+                while pygame.time.get_ticks() / 1000 - report_started < 5.0:
+                    for event in pygame.event.get():
+                        if event.type == pygame.QUIT or (
+                            event.type == pygame.KEYDOWN
+                            and event.key in (pygame.K_ESCAPE, pygame.K_q)
+                        ):
+                            was_cancelled = True
+                    if was_cancelled:
+                        break
+                    screen.fill((12, 16, 26))
+                    report_title = title_font.render(
+                        "Nine-target diagnosis report",
+                        True,
+                        (235, 239, 250),
+                    )
+                    screen.blit(
+                        report_title,
+                        report_title.get_rect(center=(width // 2, 48)),
+                    )
+                    line_spacing = min(
+                        27, max(16, (height - 150) // max(1, len(report) - 1))
+                    )
+                    start_y = max(
+                        75, (height - (len(report) - 1) * line_spacing) // 2
+                    )
+                    for line_index, line in enumerate(report):
+                        rendered = report_font.render(
+                            line, True, (220, 225, 235)
+                        )
+                        screen.blit(
+                            rendered,
+                            rendered.get_rect(
+                                center=(
+                                    width // 2,
+                                    start_y + line_index * line_spacing,
+                                )
+                            ),
+                        )
+                    screen.blit(
+                        small_font.render(
+                            "Free-look starts next; press Q or Esc to exit.",
+                            True,
+                            (165, 180, 200),
+                        ),
+                        small_font.render(
+                            "Free-look starts next; press Q or Esc to exit.",
+                            True,
+                            (165, 180, 200),
+                        ).get_rect(center=(width // 2, height - 35)),
+                    )
+                    pygame.display.flip()
+                    clock.tick(30)
+
+            if not was_cancelled:
+                free_look_started = pygame.time.get_ticks() / 1000
+                while pygame.time.get_ticks() / 1000 - free_look_started < 20.0:
+                    now = pygame.time.get_ticks() / 1000
+                    frame_ok, frame = capture.read()
+                    if not frame_ok:
+                        raise RuntimeError("Failed to read a frame from the camera.")
+                    result = face_mesh.process(
+                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    )
+                    predicted: tuple[float, float] | None = None
+                    if result.multi_face_landmarks:
+                        points = [
+                            (landmark.x, landmark.y)
+                            for landmark in result.multi_face_landmarks[0].landmark
+                        ]
+                        gaze = normalized_gaze(
+                            points, (frame.shape[1], frame.shape[0])
+                        )
+                        if gaze is not None:
+                            predicted = predict_screen_position(
+                                gaze, x_coefficients, y_coefficients
+                            )
+                    for event in pygame.event.get():
+                        if event.type == pygame.QUIT or (
+                            event.type == pygame.KEYDOWN
+                            and event.key in (pygame.K_ESCAPE, pygame.K_q)
+                        ):
+                            was_cancelled = True
+                    screen.fill((12, 16, 26))
+                    remaining = max(
+                        0, 20 - int(pygame.time.get_ticks() / 1000 - free_look_started)
+                    )
+                    free_look_title = title_font.render(
+                        f"Free-look — raw cursor — {remaining}s",
+                        True,
+                        (235, 239, 250),
+                    )
+                    screen.blit(
+                        free_look_title,
+                        free_look_title.get_rect(center=(width // 2, 48)),
+                    )
+                    if predicted is not None:
+                        cursor = (
+                            min(max(round(predicted[0]), 0), width - 1),
+                            min(max(round(predicted[1]), 0), height - 1),
+                        )
+                        pygame.draw.circle(
+                            screen, (110, 255, 165), cursor, 12, width=2
+                        )
+                        pygame.draw.line(
+                            screen,
+                            (110, 255, 165),
+                            (cursor[0] - 8, cursor[1]),
+                            (cursor[0] + 8, cursor[1]),
+                            2,
+                        )
+                        pygame.draw.line(
+                            screen,
+                            (110, 255, 165),
+                            (cursor[0], cursor[1] - 8),
+                            (cursor[0], cursor[1] + 8),
+                            2,
+                        )
+                    pygame.display.flip()
+                    clock.tick(30)
+                    if was_cancelled:
+                        break
+    finally:
+        capture.release()
+        pygame.quit()
+
+
+def hold_error_screen(message: str) -> None:
+    pygame.init()
+    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    pygame.display.set_caption("Gaze Control Error")
+    font = pygame.font.Font(None, 30)
+    small_font = pygame.font.Font(None, 24)
+    clock = pygame.time.Clock()
+    width, height = screen.get_size()
+    lines = textwrap.wrap(message, width=75) or [message]
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT or (
+                event.type == pygame.KEYDOWN
+                and event.key in (pygame.K_ESCAPE, pygame.K_q)
+            ):
+                running = False
+
+        screen.fill((20, 12, 18))
+        title = font.render("Gaze Control stopped after an error", True, (255, 145, 135))
+        screen.blit(title, title.get_rect(center=(width // 2, height // 2 - 70)))
+        for index, line in enumerate(lines[:5]):
+            rendered = small_font.render(line, True, (230, 220, 220))
+            screen.blit(
+                rendered,
+                rendered.get_rect(
+                    center=(width // 2, height // 2 - 20 + index * 30)
+                ),
+            )
+        action = small_font.render("Press Q or Esc to close.", True, (195, 204, 220))
+        screen.blit(action, action.get_rect(center=(width // 2, height // 2 + 150)))
+        pygame.display.flip()
+        clock.tick(30)
+    pygame.quit()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run Gaze Control face, iris, and calibration tools."
+        description="Run Gaze Control face, iris, calibration, and diagnosis tools."
     )
     parser.add_argument(
         "--camera-index",
@@ -1358,16 +1762,25 @@ def main() -> int:
         action="store_true",
         help="Open the face/iris diagnostic preview without calibration.",
     )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Run read-only nine-point and free-look gaze diagnosis.",
+    )
     args = parser.parse_args()
 
+    keep_error_window = not args.diagnose
     try:
-        if args.calibrate:
+        if args.diagnose:
+            run_diagnose(args.camera_index)
+        elif args.calibrate:
             run_calibration(args.camera_index)
         elif args.preview:
             run(args.camera_index)
         else:
             config_status = calibration_config_status()
             if config_status != "valid":
+                keep_error_window = True
                 print(
                     f"Calibration config is {config_status}; starting calibration.",
                     file=sys.stderr,
@@ -1375,7 +1788,10 @@ def main() -> int:
                 run_calibration(args.camera_index)
             else:
                 run(args.camera_index)
-    except RuntimeError as error:
+    except Exception as error:
+        traceback.print_exc()
+        if keep_error_window:
+            hold_error_screen(str(error))
         print(f"Error: {error}", file=sys.stderr)
         return 1
     return 0

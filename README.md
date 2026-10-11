@@ -4,8 +4,8 @@ Hands-free screen control via webcam gaze and blinks.
 Pygame full-screen demo. Offline. CPU-only.
 
 ## Status
-Stages 0–2 complete. Stage 3 now uses fixed-window calibration, per-dot fit
-residual checks with bad-dot-only redo, and five-point live cursor verification.
+Stages 0–2 complete. Stage 3 now uses forgiving 30-frame-per-target
+calibration, one polynomial fit, and a relaxed 20%-of-diagonal error threshold.
 Live acceptance is pending.
 
 ## Setup
@@ -17,7 +17,14 @@ pip install -r requirements.txt
 `python main.py` starts calibration if `config.json` is missing, invalid, or
 not verified; otherwise it opens the diagnostic preview. Use
 `.venv\Scripts\python.exe main.py --calibrate` to repeat calibration, or
-`python main.py --preview` to explicitly open the face/iris diagnostic.
+`python main.py --preview` to explicitly open the face/iris diagnostic. Run
+`.venv\Scripts\python.exe main.py --diagnose` to assess an already verified
+calibration without changing its config.
+
+Diagnosis presents the nine calibration-grid targets with a 3-second countdown
+and 2-second prediction window per target, then prints and displays the pixel
+error and signed axis biases. It ends with 20 seconds of unfiltered free-look.
+It requires a verified `config.json`; it does not recalibrate or refit.
 
 See STAGE_1.md, STAGE_2.md, and STAGE_3.md for details and acceptance checks.
 Press Q or Esc to close the preview or cancel calibration.

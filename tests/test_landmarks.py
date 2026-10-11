@@ -1,3 +1,4 @@
+import io
 import json
 import tempfile
 import unittest
@@ -12,10 +13,13 @@ from main import (
     eye_aspect_ratio,
     extract_iris_centers,
     fit_calibration,
+    fit_mvp_calibration,
     calibration_acceptance_passed,
     calibration_config_status,
-    calibration_sample_rejection_reason,
+    calibration_frame_is_valid,
+    calibration_mvp_passed,
     countdown_number,
+    diagnosis_report,
     FACE_LANDMARK_INDICES,
     FACE_MODEL_POINTS,
     estimate_head_pose,
@@ -23,12 +27,12 @@ from main import (
     gaze_is_steady,
     gaze_standard_deviation,
     mean_2d_error,
+    main as main_entrypoint,
     next_dot_retry_count,
     median_head_pose,
     normalized_gaze,
     per_dot_residuals,
     predict_screen_position,
-    relative_head_pose,
     save_calibration,
     verification_mean_error,
     verification_passed,
@@ -122,36 +126,47 @@ class IrisGazeTests(unittest.TestCase):
 
 
 class CalibrationTests(unittest.TestCase):
-    def test_sample_rejection_explains_ear_and_head_pose_thresholds(self) -> None:
-        reason = calibration_sample_rejection_reason(
-            (0.5, 0.5),
-            0.22,
-            (17.0, -16.0),
-            (0.0, 0.0),
+    def test_mvp_accepts_reasonably_open_eyes_without_head_pose_filter(self) -> None:
+        self.assertTrue(
+            calibration_frame_is_valid(True, (0.5, 0.5), 0.16)
+        )
+        self.assertFalse(
+            calibration_frame_is_valid(True, (0.5, 0.5), 0.15)
+        )
+        self.assertFalse(
+            calibration_frame_is_valid(False, (0.5, 0.5), 0.3)
+        )
+        self.assertFalse(
+            calibration_frame_is_valid(True, None, 0.3)
         )
 
-        self.assertEqual(
-            reason,
-            "EAR 0.22 <= 0.25; yaw +17.0 >= 15 deg; pitch -16.0 <= -15 deg",
-        )
+    def test_mvp_calibration_passes_only_below_twenty_percent_error(self) -> None:
+        self.assertTrue(calibration_mvp_passed(0.19))
+        self.assertFalse(calibration_mvp_passed(0.20))
+        self.assertFalse(calibration_mvp_passed(None))
 
-    def test_sample_is_accepted_when_all_locked_filters_pass(self) -> None:
-        self.assertIsNone(
-            calibration_sample_rejection_reason(
-                (0.5, 0.5), 0.30, (2.0, -3.0), (0.0, 0.0)
+    def test_mvp_fit_uses_all_targets_and_fits_once(self) -> None:
+        gaze_grid = [
+            (gx, gy)
+            for gy in (0.2, 0.5, 0.8)
+            for gx in (0.2, 0.5, 0.8)
+        ]
+        targets = [
+            (x, y)
+            for y in (100, 500, 900)
+            for x in (100, 500, 900)
+        ]
+        dot_samples = [[gaze] * 30 for gaze in gaze_grid]
+
+        with patch("main.fit_calibration", wraps=fit_calibration) as fit:
+            x_coefficients, y_coefficients, error = fit_mvp_calibration(
+                dot_samples, targets, (1000, 1000)
             )
-        )
 
-    def test_head_pose_filter_uses_neutral_baseline(self) -> None:
-        baseline = (24.0, -18.0)
-        pose = (26.0, -15.0)
-
-        self.assertEqual(relative_head_pose(pose, baseline), (2.0, 3.0))
-        self.assertIsNone(
-            calibration_sample_rejection_reason(
-                (0.5, 0.5), 0.30, pose, baseline
-            )
-        )
+        self.assertEqual(fit.call_count, 1)
+        self.assertEqual(len(x_coefficients), 6)
+        self.assertEqual(len(y_coefficients), 6)
+        self.assertAlmostEqual(error, 0.0)
 
     def test_neutral_pose_uses_median_and_requires_ten_readings(self) -> None:
         samples = [(float(index), float(index + 2)) for index in range(10)]
@@ -391,6 +406,74 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(len(points), 5)
         self.assertTrue(all(64 <= x <= 576 for x, _ in points))
         self.assertTrue(all(48 <= y <= 432 for _, y in points))
+
+
+class DiagnosisTests(unittest.TestCase):
+    def test_report_calculates_errors_and_signed_axis_biases(self) -> None:
+        report, mean_error, x_bias, y_bias = diagnosis_report(
+            [(3, 4), (0, 0), (2, 1)],
+            [(6.0, 8.0), None, (2.0, 4.0)],
+            (3, 4),
+        )
+
+        self.assertEqual(mean_error, 4.0)
+        self.assertEqual(x_bias, 1.5)
+        self.assertEqual(y_bias, 3.5)
+        report_text = "\n".join(report)
+        self.assertIn("(6, 8)", report[1])
+        self.assertIn("100.0%", report[1])
+        self.assertIn("N/A", report[2])
+        self.assertIn("Mean error: 4 px   (80.0% of diagonal)", report_text)
+        self.assertIn("X-axis bias: +2 px", report_text)
+        self.assertIn("Y-axis bias: +4 px", report_text)
+
+    def test_diagnose_reports_invalid_config_before_opening_camera(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch("main.calibration_config_status", return_value="missing"),
+            patch("main.cv2.VideoCapture") as video_capture,
+            patch("main.sys.argv", ["main.py", "--diagnose"]),
+            patch("main.sys.stderr", stderr),
+        ):
+            exit_code = main_entrypoint()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("Cannot run --diagnose: calibration config is missing", stderr.getvalue())
+        video_capture.assert_not_called()
+
+    def test_diagnose_reports_unverified_config_before_opening_camera(self) -> None:
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text('{"verified": false}', encoding="utf-8")
+            with (
+                patch("main.CALIBRATION_CONFIG", config_path),
+                patch("main.calibration_config_status", return_value="corrupt"),
+                patch("main.cv2.VideoCapture") as video_capture,
+                patch("main.sys.argv", ["main.py", "--diagnose"]),
+                patch("main.sys.stderr", stderr),
+            ):
+                exit_code = main_entrypoint()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("calibration config is unverified", stderr.getvalue())
+        video_capture.assert_not_called()
+
+
+class CalibrationErrorHandlingTests(unittest.TestCase):
+    def test_calibration_exception_prints_traceback_and_keeps_error_screen(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch("main.sys.argv", ["main.py", "--calibrate"]),
+            patch("main.run_calibration", side_effect=RuntimeError("camera failed")),
+            patch("main.hold_error_screen") as hold_screen,
+            patch("main.sys.stderr", stderr),
+        ):
+            exit_code = main_entrypoint()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("Traceback (most recent call last)", stderr.getvalue())
+        hold_screen.assert_called_once_with("camera failed")
 
 
 if __name__ == "__main__":

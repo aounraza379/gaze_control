@@ -15,8 +15,7 @@ facial landmarks. The app does not control the OS cursor or other applications.
 - Stage 1: landmarks — COMPLETE; user confirmed smooth tracking
 - Stage 2: iris — COMPLETE; user confirmed directional response; raw gaze is
   noisy and has small dynamic range
-- Stage 3: calibration and cursor verification — IMPLEMENTED; live acceptance
-  pending
+- Stage 3: forgiving MVP calibration — IMPLEMENTED; live acceptance pending
 - Stage 4: smoothing — PENDING
 - Stage 5: dwell — PENDING
 - Stage 6: blink — PENDING
@@ -39,44 +38,36 @@ facial landmarks. The app does not control the OS cursor or other applications.
 ## Stage 3 architecture and implementation
 - Run `.\.venv\Scripts\python.exe main.py --calibrate` for full-screen 3x3
   calibration.
-- Captures only a user-specific neutral head-pose median: 0.5-second settle,
-  2-second capture, at least 10 readings.
-- For each dot: a pulsing 3-2-1 countdown (one second per number) with the
-  instruction to look at the dot and hold steady, then a fixed 1-second
-  collection window. Sensor-valid samples require detected face, gaze
-  available, EAR > 0.25, and yaw/pitch each within 15 degrees of the neutral
-  head-pose baseline.
-- Each dot must pass gx and gy population standard deviation <= 0.02.
-  Unsteady dots show a warning and repeat. Up to three retries are allowed per
-  dot; a third failed retry aborts calibration.
-- Fits the existing six-term quadratic model using NumPy `lstsq`.
-- Reports mean predicted-position residual for each dot. Missing samples or
-  residual above 15% of screen diagonal mark that dot bad; only bad dots are
-  repeated, then the model and all residuals are recomputed.
-- After all dot residuals pass, presents five random verification points for
-  one second each. The fitted cursor is drawn live with current pixel error;
-  per-point and overall mean error are reported at the end. Verification passes
-  only if overall mean error is below 10% of screen diagonal.
-- Only after verification passes does it save coefficients with
-  `verified: true`, provided all nine dots passed steadiness. Missing, corrupt,
-  and unverified configs start calibration; future interaction stages must
-  require the verified marker.
-- Stage 3 live calibration and cursor direction verification remain pending.
-  Procedure: `STAGE_3.md`.
+- Every target shows a pulsing 3-2-1 countdown, then collects 30 valid frames.
+  Valid frames require face detection, available gaze, and EAR > 0.15; head
+  pose and gaze steadiness are not gates.
+- A progress bar shows frame count, and every accepted frame is logged to the
+  terminal. If a target cannot reach 30 frames in 20 seconds, it pauses for an
+  explicit **Retry this dot** click.
+- Fits the existing six-term quadratic model on all nine dots once using
+  NumPy `lstsq`. Mean in-sample error below 20% of screen diagonal
+  saves coefficients with `verified: true`; failure offers an explicit
+  **Retry calibration** button without automatically restarting.
+- Unexpected exceptions print a full traceback and leave an error screen open
+  until closed. Missing, corrupt, and unverified configs cannot enable later
+  interaction stages.
+- Stage 3 live calibration remains pending. Procedure: `STAGE_3.md`.
 
 ## Validation
-- Tests cover landmark and gaze calculations, unchanged polynomial fit,
-  per-dot residual selection, pixel prediction, verification pass/fail, and
-  verified-config status.
+- Tests cover landmark/gaze calculations, polynomial fitting, MVP frame
+  validity and acceptance, and verified-config status.
 - Run `.venv\Scripts\python.exe -m unittest discover -s tests -v`.
 
 ## Current and next work
-- Current: user runs Stage 3, confirms residual handling and five-point cursor
-  verification, and checks top-left, center, and bottom-right direction.
-- If the cursor moves opposite to gaze, use live verification evidence to
-  diagnose the normalization/model sign convention; do not add another
-  pre-calibration matching gate.
-- Do not proceed to Stage 4+ until Stage 3 live verification passes.
+- Current: user runs Stage 3 and confirms 30-frame collection completes, the
+  fit succeeds, and `config.json` is saved.
+- The read-only diagnostic can be run with
+  `.venv\Scripts\python.exe main.py --diagnose` after verified calibration.
+  It reports mean predictions/errors at the nine grid positions and follows
+  with 20 seconds of unfiltered free-look; it never recalibrates or saves.
+- Stage 4 cursor smoothing/interaction has not been implemented; there is no
+  cursor-smoothing screen that calibration transitions into yet.
+- Do not proceed to Stage 4+ until Stage 3 live calibration is confirmed.
 
 ## Handoff guidance
 - Keep behavior offline, CPU-only, and within the locked scope.
